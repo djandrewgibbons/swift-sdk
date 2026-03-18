@@ -511,8 +511,9 @@ import Logging
             var messageWithNewline = message
             messageWithNewline.append(UInt8(ascii: "\n"))
 
-            // Use a local actor-isolated variable to track continuation state
-            var sendContinuationResumed = false
+            // Use a local variable to track continuation state.
+            // nonisolated(unsafe) suppresses Sending diagnostic — access is guarded by @MainActor Task.
+            nonisolated(unsafe) var sendContinuationResumed = false
 
             try await withCheckedThrowingContinuation {
                 [weak self] (continuation: CheckedContinuation<Void, Swift.Error>) in
@@ -747,7 +748,8 @@ import Logging
         /// - Returns: The received data chunk
         /// - Throws: Network errors or transport failures
         private func receiveData() async throws -> Data {
-            var receiveContinuationResumed = false
+            // nonisolated(unsafe) suppresses Sending diagnostic — access is guarded by @MainActor Task.
+            nonisolated(unsafe) var receiveContinuationResumed = false
 
             return try await withCheckedThrowingContinuation {
                 [weak self] (continuation: CheckedContinuation<Data, Swift.Error>) in
