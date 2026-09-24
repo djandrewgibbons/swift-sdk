@@ -249,6 +249,12 @@ public actor Client {
                             )
                         }
                     }
+                    // The stream finished without error: the peer closed the transport.
+                    // Re-reading a finished stream returns immediately, so looping here spins.
+                    if Task.isCancelled { break }
+                    await logger?.debug("Transport stream finished; ending message loop.")
+                    failPendingRequests(with: MCPError.connectionClosed)
+                    break
                 } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
                     try? await Task.sleep(for: .milliseconds(10))
                     continue
@@ -481,6 +487,14 @@ public actor Client {
 
     private func removePendingRequest(id: ID) -> AnyPendingRequest? {
         return pendingRequests.removeValue(forKey: id)
+    }
+
+    private func failPendingRequests(with error: Swift.Error) {
+        let requests = pendingRequests
+        pendingRequests = [:]
+        for (_, request) in requests {
+            request.resume(throwing: error)
+        }
     }
 
     // MARK: - Batching
