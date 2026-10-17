@@ -1,3 +1,4 @@
+import Dispatch
 import Logging
 
 import struct Foundation.Data
@@ -54,10 +55,9 @@ import struct Foundation.Data
         public nonisolated let logger: Logger
 
         private var isConnected = false
-        private var readTask: Task<Void, Never>?
+        private var reader: StdioReader?
+        private var writer: StdioWriter?
         private var disconnectTask: Task<Void, Never>?
-        private var activeSends = 0
-        private var sendsDrained: CheckedContinuation<Void, Never>?
         private let messageStream: AsyncThrowingStream<Data, Swift.Error>
         private let messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
         private struct DescriptorState {
@@ -96,7 +96,7 @@ import struct Foundation.Data
         /// Establishes connection with the transport
         ///
         /// This method configures the file descriptors for non-blocking I/O
-        /// and starts the background message reading loop.
+        /// and starts watching the input for readability.
         ///
         /// - Throws: Error if the file descriptors cannot be configured
         public func connect() async throws {
@@ -113,13 +113,11 @@ import struct Foundation.Data
             }
             inputState = originalInputState
 
+            writer = StdioWriter(output: output)
+            reader = StdioReader(
+                input: input, logger: logger, continuation: messageContinuation)
             isConnected = true
             logger.debug("Transport connected successfully")
-
-            // Start reading loop in background
-            readTask = Task {
-                await readLoop()
-            }
         }
 
         /// Configures a file descriptor for non-blocking I/O
@@ -166,57 +164,10 @@ import struct Foundation.Data
             }
         }
 
-        /// Continuous loop that reads and processes incoming messages
-        ///
-        /// This method runs in the background while the transport is connected,
-        /// parsing complete messages delimited by newlines and yielding them
-        /// to the message stream.
-        private func readLoop() async {
-            let bufferSize = 4096
-            var buffer = [UInt8](repeating: 0, count: bufferSize)
-            var pendingData = Data()
-
-            while isConnected && !Task.isCancelled {
-                do {
-                    let bytesRead = try buffer.withUnsafeMutableBufferPointer { pointer in
-                        try input.read(into: UnsafeMutableRawBufferPointer(pointer))
-                    }
-
-                    if bytesRead == 0 {
-                        logger.notice("EOF received")
-                        break
-                    }
-
-                    pendingData.append(Data(buffer[..<bytesRead]))
-
-                    // Process complete messages
-                    while let newlineIndex = pendingData.firstIndex(of: UInt8(ascii: "\n")) {
-                        let messageData = pendingData[..<newlineIndex]
-                        pendingData = pendingData[(newlineIndex + 1)...]
-
-                        if !messageData.isEmpty {
-                            logger.trace(
-                                "Message received", metadata: ["size": "\(messageData.count)"])
-                            messageContinuation.yield(Data(messageData))
-                        }
-                    }
-                } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                    try? await Task.sleep(for: .milliseconds(10))
-                    continue
-                } catch {
-                    if !Task.isCancelled {
-                        logger.error("Read error occurred", metadata: ["error": "\(error)"])
-                    }
-                    break
-                }
-            }
-
-            messageContinuation.finish()
-        }
-
         /// Disconnects from the transport
         ///
-        /// This stops the message reading loop and releases associated resources.
+        /// This stops reading, fails queued sends, and finishes the message stream.
+        /// The file descriptors are left open.
         public func disconnect() async {
             if let disconnectTask {
                 await disconnectTask.value
@@ -224,20 +175,17 @@ import struct Foundation.Data
             }
             guard isConnected else { return }
             isConnected = false
-            let read = readTask
-            read?.cancel()
+            let reader = self.reader
+            let writer = self.writer
+            self.reader = nil
+            self.writer = nil
             let cleanup = Task {
-                await read?.value
-                if activeSends > 0 {
-                    await withCheckedContinuation { continuation in
-                        sendsDrained = continuation
-                    }
-                }
+                await reader?.stop()
+                await writer?.close()
                 if let inputState { restoreFlags(inputState, for: input) }
                 if let outputState { restoreFlags(outputState, for: output) }
                 inputState = nil
                 outputState = nil
-                readTask = nil
                 messageContinuation.finish()
             }
             disconnectTask = cleanup
@@ -255,41 +203,14 @@ import struct Foundation.Data
         /// - Parameter message: The message data to send (without a trailing newline)
         /// - Throws: Error if the message cannot be sent
         public func send(_ message: Data) async throws {
-            guard isConnected else {
+            guard isConnected, let writer else {
                 throw MCPError.transportError(Errno(rawValue: ENOTCONN))
             }
-            activeSends += 1
-            defer {
-                activeSends -= 1
-                if activeSends == 0 {
-                    sendsDrained?.resume()
-                    sendsDrained = nil
-                }
-            }
-
             // Add newline as delimiter
             var messageWithNewline = message
             messageWithNewline.append(UInt8(ascii: "\n"))
 
-            var remaining = messageWithNewline
-            while !remaining.isEmpty {
-                guard isConnected else {
-                    throw MCPError.transportError(Errno(rawValue: ENOTCONN))
-                }
-                do {
-                    let written = try remaining.withUnsafeBytes { buffer in
-                        try output.write(UnsafeRawBufferPointer(buffer))
-                    }
-                    if written > 0 {
-                        remaining = remaining.dropFirst(written)
-                    }
-                } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                    try await Task.sleep(for: .milliseconds(10))
-                    continue
-                } catch {
-                    throw MCPError.transportError(error)
-                }
-            }
+            try await writer.write(messageWithNewline)
         }
 
         /// Receives messages from the transport.
@@ -301,6 +222,180 @@ import struct Foundation.Data
         /// - Returns: An AsyncThrowingStream of Data objects representing JSON-RPC messages
         public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
             return messageStream
+        }
+    }
+
+    /// Reads newline-delimited messages from a non-blocking descriptor when a dispatch read
+    /// source reports it readable, so an idle transport causes no wakeups.
+    ///
+    /// Mutable state is confined to the source's queue. The descriptor is not owned and is
+    /// never closed.
+    private final class StdioReader: @unchecked Sendable {
+        private let input: FileDescriptor
+        private let logger: Logger
+        private let continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+        private let queue = DispatchQueue(label: "mcp.transport.stdio.read")
+        private let source: DispatchSourceRead
+        private var buffer = [UInt8](repeating: 0, count: 4096)
+        private var pendingData = Data()
+
+        init(
+            input: FileDescriptor,
+            logger: Logger,
+            continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+        ) {
+            self.input = input
+            self.logger = logger
+            self.continuation = continuation
+            self.source = DispatchSource.makeReadSource(
+                fileDescriptor: input.rawValue, queue: queue)
+            // The handler retains self until cancellation releases it.
+            source.setEventHandler { self.readAvailable() }
+            source.activate()
+        }
+
+        /// Returns once no read handler is running or can start.
+        func stop() async {
+            source.cancel()
+            await withCheckedContinuation { continuation in
+                queue.async { continuation.resume() }
+            }
+        }
+
+        private func readAvailable() {
+            while true {
+                let bytesRead: Int
+                do {
+                    bytesRead = try buffer.withUnsafeMutableBytes { try input.read(into: $0) }
+                } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
+                    return
+                } catch {
+                    logger.error("Read error occurred", metadata: ["error": "\(error)"])
+                    finish()
+                    return
+                }
+
+                if bytesRead == 0 {
+                    logger.notice("EOF received")
+                    finish()
+                    return
+                }
+
+                pendingData.append(contentsOf: buffer[..<bytesRead])
+
+                while let newlineIndex = pendingData.firstIndex(of: UInt8(ascii: "\n")) {
+                    let messageData = pendingData[..<newlineIndex]
+                    pendingData = pendingData[(newlineIndex + 1)...]
+
+                    if !messageData.isEmpty {
+                        logger.trace(
+                            "Message received", metadata: ["size": "\(messageData.count)"])
+                        continuation.yield(Data(messageData))
+                    }
+                }
+            }
+        }
+
+        private func finish() {
+            continuation.finish()
+            source.cancel()
+        }
+    }
+
+    /// Writes messages in FIFO order to a non-blocking descriptor. On `EAGAIN` it arms a
+    /// dispatch write source and resumes when the descriptor is writable, instead of polling.
+    /// Whole messages are written before the next starts, so concurrent sends never interleave.
+    ///
+    /// Mutable state is confined to `queue`. The descriptor is not owned and is never closed.
+    private final class StdioWriter: @unchecked Sendable {
+        private struct Pending {
+            var remaining: Data
+            let continuation: CheckedContinuation<Void, Swift.Error>
+        }
+
+        private let output: FileDescriptor
+        private let queue = DispatchQueue(label: "mcp.transport.stdio.write")
+        private var pending: [Pending] = []
+        private var writableSource: DispatchSourceWrite?
+        private var isClosed = false
+
+        init(output: FileDescriptor) {
+            self.output = output
+        }
+
+        func write(_ data: Data) async throws {
+            try await withCheckedThrowingContinuation { continuation in
+                queue.async {
+                    self.enqueue(Pending(remaining: data, continuation: continuation))
+                }
+            }
+        }
+
+        /// Fails queued messages and stops waiting for writability. Returns once no write is
+        /// in progress or can start.
+        func close() async {
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                queue.async {
+                    self.closeOnQueue()
+                    done.resume()
+                }
+            }
+        }
+
+        private func closeOnQueue() {
+            isClosed = true
+            writableSource?.cancel()
+            writableSource = nil
+            let failed = pending
+            pending = []
+            for item in failed {
+                item.continuation.resume(
+                    throwing: MCPError.transportError(Errno(rawValue: ENOTCONN)))
+            }
+        }
+
+        private func enqueue(_ item: Pending) {
+            guard !isClosed else {
+                item.continuation.resume(
+                    throwing: MCPError.transportError(Errno(rawValue: ENOTCONN)))
+                return
+            }
+            pending.append(item)
+            if writableSource == nil {
+                drain()
+            }
+        }
+
+        private func drain() {
+            while !pending.isEmpty {
+                do {
+                    let written = try pending[0].remaining.withUnsafeBytes {
+                        try output.write($0)
+                    }
+                    pending[0].remaining = pending[0].remaining.dropFirst(written)
+                    if pending[0].remaining.isEmpty {
+                        pending.removeFirst().continuation.resume()
+                    }
+                } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
+                    awaitWritable()
+                    return
+                } catch {
+                    pending.removeFirst().continuation.resume(
+                        throwing: MCPError.transportError(error))
+                }
+            }
+        }
+
+        private func awaitWritable() {
+            let source = DispatchSource.makeWriteSource(
+                fileDescriptor: output.rawValue, queue: queue)
+            source.setEventHandler {
+                source.cancel()
+                self.writableSource = nil
+                self.drain()
+            }
+            writableSource = source
+            source.activate()
         }
     }
 #endif
