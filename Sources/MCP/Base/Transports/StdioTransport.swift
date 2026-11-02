@@ -62,8 +62,8 @@ import struct Foundation.Data
         private let messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
         private struct DescriptorState {
             let flags: CInt
-            let device: UInt64
-            let inode: UInt64
+            let device: dev_t
+            let inode: ino_t
         }
         private var inputState: DescriptorState?
         private var outputState: DescriptorState?
@@ -142,7 +142,7 @@ import struct Foundation.Data
                     throw MCPError.transportError(Errno(rawValue: CInt(errno)))
                 }
                 return DescriptorState(
-                    flags: flags, device: UInt64(status.st_dev), inode: UInt64(status.st_ino))
+                    flags: flags, device: status.st_dev, inode: status.st_ino)
             #else
                 // For platforms where non-blocking operations aren't supported
                 throw MCPError.internalError(
@@ -154,8 +154,8 @@ import struct Foundation.Data
             guard state.flags & O_NONBLOCK == 0 else { return }
             var status = stat()
             guard fstat(fileDescriptor.rawValue, &status) == 0,
-                UInt64(status.st_dev) == state.device,
-                UInt64(status.st_ino) == state.inode
+                status.st_dev == state.device,
+                status.st_ino == state.inode
             else { return }
             let currentFlags = fcntl(fileDescriptor.rawValue, F_GETFL)
             guard currentFlags >= 0 else { return }
